@@ -1,0 +1,235 @@
+FROM php:{{ .Env.PHP_VERSION }}-apache
+
+# common-php70
+ENV DEBIAN_FRONTEND noninteractive
+ENV APACHE_DOCROOT /var/www/html
+ENV PATH=/var/www/vendor/bin:$PATH
+ENV COMPOSER_MEMORY_LIMIT "-1"
+
+{{- if eq .Env.PHP_VERSION "7.0" }}
+
+# Update stretch repositories
+RUN sed -i -e 's/deb.debian.org/archive.debian.org/g' \
+           -e 's|security.debian.org|archive.debian.org/|g' \
+           -e '/stretch-updates/d' /etc/apt/sources.list{{- end }}
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      # for bz2
+      bzip2 libbz2-dev \
+      # for ftp
+      libssl-dev \
+      # for gd
+      libfreetype6-dev libjpeg62-turbo-dev libpng-dev \
+      # for intl
+      libicu-dev \
+      # for dom
+      libxml2-dev \
+      # for ldap
+      libldap2-dev \
+      # for mysql
+      mariadb-client \
+      # for ssh client only
+      openssh-client \
+      # For image optimization
+      jpegoptim \
+      optipng \
+      pngquant \
+      # php7.3 needs zlib1g-dev and libzip-dev for the zip extension
+      # https://github.com/docker-library/php/issues/61#issuecomment-468874705
+      zlib1g-dev \
+      libzip-dev \
+      # for git
+      git \
+      # for composer
+      unzip \
+    && apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+RUN docker-php-ext-configure gd {{if (not (atoi .Env.PHP_AT_LEAST_7_4))}}--with-freetype-dir=/usr/include/ --with-jpeg-dir=/usr/include/{{ end }} \
+    && docker-php-ext-configure ldap --with-libdir="lib/$(dpkg-architecture --query DEB_HOST_MULTIARCH)" \
+    && docker-php-ext-install -j$(nproc) \
+      bcmath \
+      bz2 \
+      calendar \
+      exif \
+      ftp \
+      gd \
+      gettext \
+      intl \
+      ldap \
+      mysqli \
+      opcache \
+      pcntl \
+      pdo_mysql \
+      shmop \
+      soap \
+      sockets \
+      sysvmsg \
+      sysvsem \
+      sysvshm \
+      zip \
+    && pecl install redis apcu \
+    && docker-php-ext-enable redis apcu
+
+# Configure Apache:
+RUN a2enmod rewrite headers expires \
+  && sed -i "/DocumentRoot \/var\/www\/html/c\\\tDocumentRoot \$\{APACHE_DOCROOT\}" /etc/apache2/sites-enabled/000-default.conf \
+  # Preemptively add a user 1000, for use with $APACHE_RUN_USER on osx
+  && adduser --uid 1000 --gecos 'My OSX User' --disabled-password osxuser
+
+# Install Composer.
+
+ARG COMPOSER_VERSION={{ .Env.COMPOSER_VERSION }}
+RUN COMPOSER_SHA384=$(curl https://composer.github.io/installer.sig) \
+  && curl -fsSL -o composer-setup.php https://getcomposer.org/installer \
+  && echo "$COMPOSER_SHA384 composer-setup.php" | sha384sum -c - \
+  && php composer-setup.php --version=$COMPOSER_VERSION --install-dir=/usr/local/bin --filename=composer
+
+# Install Dockerize.
+ARG DOCKERIZE_VERSION=v0.6.1
+ARG DOCKERIZE_SHA256=1fa29cd41a5854fd5423e242f3ea9737a50a8c3bcf852c9e62b9eb02c6ccd370
+RUN curl -fsSOL https://github.com/jwilder/dockerize/releases/download/$DOCKERIZE_VERSION/dockerize-linux-amd64-$DOCKERIZE_VERSION.tar.gz \
+    && echo "$DOCKERIZE_SHA256 dockerize-linux-amd64-$DOCKERIZE_VERSION.tar.gz" | sha256sum -c - \
+    && tar -C /usr/local/bin -xzvf dockerize-linux-amd64-$DOCKERIZE_VERSION.tar.gz \
+    && rm dockerize-linux-amd64-$DOCKERIZE_VERSION.tar.gz
+
+# Install Drush Launcher. Whereas previously we installed Drush globally, we no longer do,
+# since it's expected that D8 sites will include their own copy of Drush, and Drush 9+ is
+# incompatible with Drupal < 8.
+# @todo: Is the launcher even needed? We add /var/www/vendor/bin on the global path.
+ARG DRUSH_LAUNCHER_VERSION=0.6.0
+ARG DRUSH_LAUNCHER_SHA256=c3f32a800a2f18470b0010cd71c49e49ef5c087f8131eecfe9b686dc1f3f3d4e
+RUN curl -fsSOL https://github.com/drush-ops/drush-launcher/releases/download/$DRUSH_LAUNCHER_VERSION/drush.phar \
+  && echo "$DRUSH_LAUNCHER_SHA256 drush.phar" | sha256sum -c - \
+  && mv drush.phar /usr/bin/drush && chmod +x /usr/bin/drush
+
+# Pre-trust Github host certificates.
+RUN ssh-keyscan github.com >> /etc/ssh/ssh_known_hosts
+
+ADD templates /templates
+ADD scripts/* /usr/local/bin/
+
+# /common-php70
+{{ if .Env.IS_DEV }}
+{{ if eq .Env.PHP_VERSION "8.4" }}
+# NodeJS + Yarn
+ARG NODE_MAJOR_VERSION={{ .Env.NODE_MAJOR_VERSION }}
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates curl gnupg; \
+    mkdir -p /etc/apt/keyrings; \
+    \
+    curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+        | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg; \
+      echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_MAJOR_VERSION}.x nodistro main" \
+        > /etc/apt/sources.list.d/nodesource.list; \
+    \
+    # Yarn repo key + repo (if you want yarn from apt)
+    curl -fsSL https://dl.yarnpkg.com/debian/pubkey.gpg \
+      | gpg --dearmor -o /etc/apt/keyrings/yarn.gpg; \
+    echo "deb [signed-by=/etc/apt/keyrings/yarn.gpg] https://dl.yarnpkg.com/debian stable main" \
+      > /etc/apt/sources.list.d/yarn.list; \
+    \
+    apt-get update; \
+    apt-get install -y --no-install-recommends nodejs yarn;
+
+{{ else if or (eq .Env.PHP_VERSION "8.3") (eq .Env.PHP_VERSION "8.2") }}
+# NodeJS + Yarn
+ARG NODE_MAJOR_VERSION={{ .Env.NODE_MAJOR_VERSION }}
+RUN apt-get update \
+  && apt-get install -y apt-transport-https lsb-release gnupg > /dev/null 2>&1 \
+  && curl -sS https://dl.yarnpkg.com/debian/pubkey.gpg | apt-key add - \
+  && curl -sL "https://deb.nodesource.com/setup_$NODE_MAJOR_VERSION.x" | bash \
+  && echo "deb https://dl.yarnpkg.com/debian/ stable main" | tee /etc/apt/sources.list.d/yarn.list \
+  && apt-get update \
+  # Force apt to use the deb.nodesource repository
+  && echo "Package: nodejs\nPin: origin deb.nodesource.com\nPin-priority: 1000" > /etc/apt/preferences.d/99-nodejs \
+  && apt-get install -y nodejs \
+  && apt-get install -y --no-install-recommends yarn \
+ \
+  && apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# XDebug
+# TODO: Remove xdebug next time it causes problems. It is a lot of effort
+# to maintain, and no one is actually using it.
+RUN pecl install xdebug \
+  && docker-php-ext-enable xdebug \
+  && echo "xdebug.mode=debug" > $PHP_INI_DIR/conf.d/xdebug.ini
+
+
+{{ else }}
+# NodeJS + Yarn
+ARG NODE_MAJOR_VERSION={{ .Env.NODE_MAJOR_VERSION }}
+RUN apt-get update \
+  && apt-get install -y apt-transport-https lsb-release gnupg > /dev/null 2>&1 \
+  && curl -s https://deb.nodesource.com/gpgkey/nodesource.gpg.key | apt-key add - \
+  && curl -sS https://dl.yarnpkg.com/debian/pubkey.gpg | apt-key add - \
+  && echo "deb https://deb.nodesource.com/node_$NODE_MAJOR_VERSION.x $(lsb_release --codename | cut -f2) main" > /etc/apt/sources.list.d/nodesource.list \
+  && echo "deb-src https://deb.nodesource.com/node_$NODE_MAJOR_VERSION.x $(lsb_release --codename | cut -f2) main" >> /etc/apt/sources.list.d/nodesource.list \
+  && echo "deb https://dl.yarnpkg.com/debian/ stable main" | tee /etc/apt/sources.list.d/yarn.list \
+  && apt-get update \
+  # Force apt to use the deb.nodesource repository
+  && echo "Package: nodejs\nPin: origin deb.nodesource.com\nPin-priority: 1000" > /etc/apt/preferences.d/99-nodejs \
+  && apt-get install -y nodejs \
+  && apt-get install -y --no-install-recommends yarn \
+{{ if (lt (atoi .Env.PHP_MAJOR_VERSION) 8) }}  && apt-get install -y python2.7 && npm config set python `which python2.7` {{ end }} \
+  && apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+
+# XDebug
+# TODO: Remove xdebug next time it causes problems. It is a lot of effort
+# to maintain, and no one is actually using it.
+RUN pecl install xdebug{{ if not .Env.XDEBUG_3 }}-2.9.0{{ end }} \
+  && docker-php-ext-enable xdebug \
+{{ if .Env.XDEBUG_3 }}  && echo "xdebug.mode=debug" > $PHP_INI_DIR/conf.d/xdebug.ini
+{{ else }}  && echo "xdebug.default_enable=0\nxdebug.coverage_enable=0" > $PHP_INI_DIR/conf.d/xdebug.ini{{ end }}
+
+{{ end }}
+{{ if eq .Env.PHP_VERSION "8.4" }}
+# Blackfire Probe. Note: We do not install Blackfire CLI. You will
+# need that in order to trigger Blackfire tests. The probe just instruments
+# things on the server side.
+RUN version=$(php -r "echo PHP_MAJOR_VERSION.PHP_MINOR_VERSION.(PHP_ZTS ? '-zts' : '');") \
+    && architecture=$(uname -m) \
+    && curl -A "Docker" -o /tmp/blackfire-probe.tar.gz -D - -L -s https://blackfire.io/api/v1/releases/probe/php/linux/$architecture/$version \
+    && mkdir -p /tmp/blackfire \
+    && tar zxpf /tmp/blackfire-probe.tar.gz -C /tmp/blackfire \
+    && mv /tmp/blackfire/blackfire-*.so $(php -r "echo ini_get ('extension_dir');")/blackfire.so \
+    && printf "extension=blackfire.so\nblackfire.agent_socket=tcp://blackfire:8307\n" > $PHP_INI_DIR/conf.d/blackfire.ini \
+    && rm -rf /tmp/blackfire /tmp/blackfire-probe.tar.gz
+
+# Terminus.
+ARG TERMINUS_VERSION={{ .Env.TERMINUS_VERSION }}
+RUN curl -fsSL \
+    "https://github.com/pantheon-systems/terminus/releases/download/${TERMINUS_VERSION}/terminus.phar" \
+    -o /usr/local/bin/terminus \
+    && chmod +x /usr/local/bin/terminus \
+    && terminus --version
+
+{{ else }}
+# Blackfire Probe. Note: We do not install Blackfire CLI. You will
+# need that in order to trigger Blackfire tests. The probe just instruments
+# things on the server side.
+RUN version=$(php -r "echo PHP_MAJOR_VERSION.PHP_MINOR_VERSION;") \
+    && curl -A "Docker" -o /tmp/blackfire-probe.tar.gz -D - -L -s https://blackfire.io/api/v1/releases/probe/php/linux/amd64/$version \
+    && mkdir -p /tmp/blackfire \
+    && tar zxpf /tmp/blackfire-probe.tar.gz -C /tmp/blackfire \
+    && mv /tmp/blackfire/blackfire-*.so $(php -r "echo ini_get('extension_dir');")/blackfire.so \
+    && printf "extension=blackfire.so\nblackfire.agent_socket=tcp://blackfire:8707\n" > $PHP_INI_DIR/conf.d/blackfire.ini \
+    && rm -rf /tmp/blackfire /tmp/blackfire-probe.tar.gz
+
+# Terminus.
+ARG TERMINUS_VERSION={{ .Env.TERMINUS_VERSION }}
+ARG TERMINUS_SHA256="{{ .Env.TERMINUS_SHA }}"
+RUN curl -fsSOL https://github.com/pantheon-systems/terminus/releases/download/$TERMINUS_VERSION/terminus.phar \
+  && echo "$TERMINUS_SHA256 terminus.phar" | sha256sum -c - \
+  && mv terminus.phar /usr/local/bin/terminus \
+  && chmod +x /usr/local/bin/terminus
+
+{{ end }}
+# Gulp-cli.
+RUN npm i --no-cache -g gulp-cli
+
+# ImageMagick
+RUN apt-get update \
+  && apt-get install -y imagemagick > /dev/null 2>&1 \
+  && apt-get clean && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
+{{ end }}
